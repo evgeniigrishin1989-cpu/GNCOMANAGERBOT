@@ -67,6 +67,8 @@ if not BOT_TOKEN:
 if not PUBLIC_BASE_URL:
     raise RuntimeError("WEBHOOK_URL is not set (e.g. https://<service>.onrender.com)")
 
+log.info("ROAPP_VERIFY_SSL=%s | ROAPP_BASE_URL=%s | CHANNEL=%s", ROAPP_VERIFY_SSL, ROAPP_BASE_URL, CHANNEL)
+
 # =========================
 # ВСПОМОГАЛКИ
 # =========================
@@ -151,7 +153,6 @@ def tokens_ru(text: str) -> List[str]:
     t = re.sub(r"[^a-zа-я0-9\s\-]+", " ", t)
     return [x for x in t.split() if x]
 
-# Синонимы → канонические токены
 CANON = {
     # цена
     "сколько": "цена", "стоит": "цена", "стоимость": "цена", "цена": "цена", "прайс": "цена",
@@ -291,6 +292,7 @@ class ROAppClient:
         if channel:
             payload["channel"] = channel
 
+        # дублируем verify на всякий случай
         r = await self._client.post("/lead/", json=payload)
         r.raise_for_status()
         return r.json()
@@ -382,7 +384,7 @@ def maybe_phone_hint(context: ContextTypes.DEFAULT_TYPE) -> str:
     context.user_data["hint_count"] = cnt + 1
     return random.choice(PHONE_HINTS) if cnt % 3 == 0 else ""
 
-# --- обработка геолокации (кнопка «Отправить местоположение» в TG)
+# --- обработка геолокации
 async def handle_location(update: Update, context: ContextTypes.DEFAULT_TYPE):
     loc = update.message.location
     context.user_data["pickup_location"] = {"lat": loc.latitude, "lon": loc.longitude}
@@ -396,7 +398,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (update.message.text or "").strip()
     hist: List[Dict[str, str]] = context.user_data.get("hist") or []
 
-    # если ждём имя (WA)
     if context.user_data.get("await_name"):
         if looks_like_name(text):
             context.user_data["name"] = text
@@ -409,12 +410,10 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     push_history(hist, "user", text)
     context.user_data["hist"] = hist
 
-    # 1) DIY — мягкий отказ
     if is_diy_request(text):
         await update.message.reply_text(DIY_SAFE_REPLY)
         return
 
-    # 1а) если прислали ссылку на карту — примем и спросим время
     mlink = extract_map_link(text)
     if mlink:
         context.user_data["pickup_link"] = mlink
@@ -425,7 +424,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(msg)
         return
 
-    # 2) Телеграм: если встретили номер — создаём лид
     phone = extract_phone(text) if CHANNEL == "telegram" else None
     if phone:
         name = context.user_data.get("name") or (friendly_name(update, context) or "Клиент")
@@ -463,7 +461,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"❌ Техническая ошибка: {e}")
             return
 
-    # 2а) Быстрые ответы (эвакуатор/адрес)
     qa = quick_intent_answer(text)
     if qa:
         if CHANNEL == "whatsapp" and not context.user_data.get("name"):
@@ -473,7 +470,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(qa)
         return
 
-    # 3) KB → если нашли, ответим
     kb_answer = kb_search(text)
     if kb_answer:
         if CHANNEL == "whatsapp" and not context.user_data.get("name"):
@@ -483,7 +479,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(kb_answer)
         return
 
-    # 4) AI
     reply = await ai_reply(text, hist)
     reply = sanitize_ai_reply(reply, bool(context.user_data.get("inquiry_id")))
     push_history(hist, "assistant", reply)
@@ -521,7 +516,7 @@ def make_aiohttp_app(ptb_app: Application) -> web.Application:
             log.exception("Failed to read CRM webhook")
         return web.Response(text="ok")
 
-    async def healthz(_request: web.Request) -> web.Response:
+    async def healthz(_request: web.Request) -> web_response:
         return web.Response(text="ok")
 
     app.router.add_post(f"/{BOT_SECRET}", telegram_updates)
