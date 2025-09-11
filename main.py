@@ -43,6 +43,9 @@ PORT            = int(os.getenv("PORT", "10000"))
 OPENAI_API_KEY  = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MODEL    = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
+# КАНАЛ: telegram / whatsapp
+CHANNEL         = os.getenv("CHANNEL", "telegram").lower().strip()
+
 ROAPP_API_KEY     = os.getenv("ROAPP_API_KEY")
 ROAPP_BASE_URL    = os.getenv("ROAPP_BASE_URL", "https://api.roapp.io")
 ROAPP_LOCATION_ID = os.getenv("ROAPP_LOCATION_ID")
@@ -80,7 +83,7 @@ def tg_display_name(update: Update) -> str:
     name = " ".join(p for p in parts if p).strip()
     return name or (u.username or f"id{u.id}")
 
-# Небольшая «память» диалога
+# Мини-история диалога
 MAX_HISTORY = 6
 def push_history(store: List[Dict[str, str]], role: str, content: str) -> None:
     if content:
@@ -88,19 +91,20 @@ def push_history(store: List[Dict[str, str]], role: str, content: str) -> None:
         while len(store) > MAX_HISTORY:
             store.pop(0)
 
-# Варианты мягкого напоминания про телефон
+# Напоминания — показываем только в Telegram и только если номера ещё нет
 PHONE_HINTS = [
     "Если хотите оформить обращение — пришлите номер в формате +XXXXXXXXXXX, всё сделаю.",
     "Готов оформить заявку — просто пришлите номер телефона в формате +XXXXXXXXXXX.",
     "Чтобы закрепить запрос и передать мастеру, нужен номер в формате +XXXXXXXXXXX.",
-    "Могу оформить обращение прямо сейчас — номер нужен в виде +XXXXXXXXXXX.",
 ]
-
-def next_phone_hint(context: ContextTypes.DEFAULT_TYPE) -> str:
-    """Показываем напоминание не чаще 1 раза в 3 ответа."""
+def maybe_phone_hint(context: ContextTypes.DEFAULT_TYPE) -> str:
+    if CHANNEL == "whatsapp":
+        return ""  # в WhatsApp номер уже есть → не просим
+    if context.user_data.get("phone"):
+        return ""  # уже знаем номер
     cnt = int(context.user_data.get("hint_count", 0))
     context.user_data["hint_count"] = cnt + 1
-    if cnt % 3 == 0:  # 0,3,6,...
+    if cnt % 3 == 0:
         return random.choice(PHONE_HINTS)
     return ""
 
@@ -151,13 +155,12 @@ RO = ROAppClient(ROAPP_API_KEY, ROAPP_BASE_URL) if ROAPP_API_KEY else None
 # =========================
 async def ai_reply(user_text: str, history: List[Dict[str, str]]) -> str:
     if not OPENAI_API_KEY:
-        # Без ключа даём простой дружелюбный ответ
         return "Понимаю. Расскажите чуть подробнее — что случилось и какая модель? Если понадобится, оформлю заявку."
 
     system = (
-        "Ты дружелюбный менеджер мотосервиса GNCO. Отвечай по-русски, естественно и тёпло, без канцелярита. "
-        "Коротко: 1–3 предложения. Сначала проявляй участие, затем один-два уточняющих вопроса "
-        "или конкретный совет по следующему шагу. Не проси номер телефона — этим займётся другой блок."
+        "Ты дружелюбный менеджер мотосервиса GNCO. Отвечай тепло и по делу, 1–3 предложения. "
+        "Если у нас уже есть номер (например, в WhatsApp), НЕ проси его повторно. "
+        "Если имя клиента неизвестно — мягко уточни имя один раз: «Как к вам обращаться?»."
     )
     messages = [{"role": "system", "content": system}]
     messages.extend(history)
@@ -176,27 +179,29 @@ async def ai_reply(user_text: str, history: List[Dict[str, str]]) -> str:
                 data = r.json()
                 return (data["choices"][0]["message"]["content"] or "").strip()[:1200]
             if r.status_code in (429, 500, 502, 503, 504):
-                await asyncio.sleep(backoff)
-                backoff = min(backoff * 2, 16)
-                continue
+                await asyncio.sleep(backoff); backoff = min(backoff * 2, 16); continue
             return f"Техническая ошибка AI: HTTP {r.status_code}"
         except Exception:
-            await asyncio.sleep(backoff)
-            backoff = min(backoff * 2, 16)
+            await asyncio.sleep(backoff); backoff = min(backoff * 2, 16)
     return "Сейчас высокая нагрузка. Давайте продолжим, а я параллельно попробую ещё раз."
 
 # =========================
 # Telegram handlers
 # =========================
-WELCOME = (
-    "Привет! Я менеджер GNCO. Расскажите, что случилось с мотоциклом — подскажу и при необходимости оформлю обращение. "
+WELCOME_TG = (
+    "Привет! Я менеджер GNCO. Расскажите, что случилось — подскажу. "
     "Если готовы сразу оформить, пришлите номер в формате +27XXXXXXXXXX."
+)
+WELCOME_WA = (
+    "Привет! Я менеджер GNCO. Расскажите, что случилось — подскажу. "
+    "Кстати, как к вам обращаться?"
 )
 
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["hist"] = []
     context.user_data["hint_count"] = 0
-    await update.message.reply_text(WELCOME)
+    # В WhatsApp номер у нас уже есть — спросим имя
+    await update.message.reply_text(WELCOME_WA if CHANNEL == "whatsapp" else WELCOME_TG)
 
 async def id_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
@@ -204,44 +209,64 @@ async def id_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode=ParseMode.HTML,
     )
 
+def looks_like_name(text: str) -> bool:
+    t = text.strip()
+    return bool(t) and not extract_phone(t) and len(t.split()) <= 4 and len(t) <= 40
+
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (update.message.text or "").strip()
     hist: List[Dict[str, str]] = context.user_data.get("hist") or []
+
+    # Если ждём имени — сохраняем и подтверждаем
+    if context.user_data.get("await_name"):
+        if looks_like_name(text):
+            context.user_data["name"] = text
+            context.user_data["await_name"] = False
+            await update.message.reply_text(f"Спасибо, {text}! Продолжайте — я помогу.")
+            return
+        else:
+            await update.message.reply_text("Как к вам обращаться? Имя можно одним словом 🙂")
+            return
+
     push_history(hist, "user", text)
     context.user_data["hist"] = hist
 
-    # 1) если видим номер — оформляем заявку
+    # Если в тексте есть номер — создаём заявку (актуально для Telegram)
     phone = extract_phone(text)
     if phone:
-        name = tg_display_name(update)
+        name = context.user_data.get("name") or tg_display_name(update)
         last_msgs = "\n".join([x["content"] for x in hist[-3:] if x["role"] == "user"])
-        # сброс частоты напоминаний
-        context.user_data["hint_count"] = 0
-
+        context.user_data["phone"] = phone  # запомним
         if RO is None:
             await update.message.reply_text(
-                f"Принял номер: <b>{phone}</b>. Сейчас ключ CRM не настроен, но я зафиксировал запрос.",
+                f"Принял номер: <b>{phone}</b>. Ключ CRM не настроен, но запрос зафиксирован.",
                 parse_mode=ParseMode.HTML,
             )
+            # если имени нет — спросим
+            if CHANNEL == "whatsapp" and not context.user_data.get("name"):
+                context.user_data["await_name"] = True
+                await update.message.reply_text("Кстати, как к вам обращаться?")
             return
-
         try:
             inquiry = await RO.create_inquiry(
                 contact_phone=phone,
                 contact_name=name,
                 title="Запрос на ремонт/запчасти",
-                description=f"Источник: Telegram.\nНедавние сообщения:\n{last_msgs}"[:900],
+                description=f"Источник: {ROAPP_SOURCE}.\nНедавние сообщения:\n{last_msgs}"[:900],
                 location_id=int(ROAPP_LOCATION_ID) if ROAPP_LOCATION_ID else None,
                 channel=ROAPP_SOURCE,
             )
-            context.user_data["phone"] = phone
             context.user_data["inquiry_id"] = inquiry.get("id")
             await update.message.reply_text(
                 "Готово! ✅ Оформил обращение.\n"
                 f"Номер: <b>{phone}</b>\nИмя: <b>{name}</b>\n"
-                "Мастер свяжется, подскажет по срокам и стоимости.",
+                "Мастер свяжется и подскажет по срокам и стоимости.",
                 parse_mode=ParseMode.HTML,
             )
+            # если имени не знает — спросит один раз
+            if CHANNEL == "whatsapp" and not context.user_data.get("name"):
+                context.user_data["await_name"] = True
+                await update.message.reply_text("Как к вам обращаться?")
             return
         except httpx.HTTPStatusError as e:
             await update.message.reply_text(
@@ -253,10 +278,18 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"❌ Техническая ошибка: {e}")
             return
 
-    # 2) иначе отвечаем как человек (AI)
+    # **Главная логика**: в WhatsApp не просим номер, уточняем имя (один раз)
+    if CHANNEL == "whatsapp" and not context.user_data.get("name"):
+        context.user_data["await_name"] = True
+        reply = await ai_reply(text, hist)
+        push_history(hist, "assistant", reply)
+        await update.message.reply_text(f"{reply}\n\nКак к вам обращаться?")
+        return
+
+    # В Telegram — даём AI-ответ и изредка напоминаем про номер
     reply = await ai_reply(text, hist)
     push_history(hist, "assistant", reply)
-    hint = next_phone_hint(context)
+    hint = maybe_phone_hint(context)
     final = reply if not hint else f"{reply}\n\n{hint}"
     await update.message.reply_text(final)
 
@@ -318,7 +351,7 @@ async def main():
     await application.bot.set_webhook(
         url=telegram_url,
         secret_token=BOT_SECRET,
-        allowed_updates=["message"],
+        allowed_updates=["message"],  # только сообщения
     )
 
     async with application:
@@ -336,3 +369,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
