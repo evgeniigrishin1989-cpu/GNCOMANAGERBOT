@@ -46,12 +46,17 @@ OPENAI_MODEL    = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 # КАНАЛ: telegram / whatsapp
 CHANNEL         = os.getenv("CHANNEL", "telegram").lower().strip()
 
-# «паспорт» компании для ответов
+# «паспорт» компании и цены
 COMPANY_NAME    = os.getenv("COMPANY_NAME", "GNCO")
-COMPANY_ADDRESS = os.getenv("COMPANY_ADDRESS", "ул. Примерная, 1")
-WORKING_HOURS   = os.getenv("WORKING_HOURS", "Ежедневно 09:00–18:00")
-CITY            = os.getenv("CITY", "Кейптаун")
+COMPANY_ADDRESS = os.getenv("COMPANY_ADDRESS", "94 Hurd Street, Newton Park, PE")
+CITY            = os.getenv("CITY", "Port Elizabeth (Gqeberha)")
+WORKING_HOURS   = os.getenv("WORKING_HOURS", "Ежедневно 09:00–17:00")
 WHATSAPP_NUMBER = os.getenv("WHATSAPP_NUMBER", "+27XXXXXXXXXX")
+
+# эвакуатор/доставка по городу
+CURRENCY        = os.getenv("CURRENCY", "R")     # валюта: R (ZAR)
+TOW_PRICE_LOCAL = os.getenv("TOW_PRICE_LOCAL", "300")  # фикс за городскую доставку
+
 
 # CRM (RO App)
 ROAPP_API_KEY     = os.getenv("ROAPP_API_KEY")
