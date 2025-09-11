@@ -70,6 +70,7 @@ if not PUBLIC_BASE_URL:
 # ВСПОМОГАЛКИ
 # =========================
 PHONE_RE = re.compile(r"\+?\d[\d\-\s()]{6,}")
+URL_RE   = re.compile(r"https?://\S+", re.I)
 
 def normalize_phone(raw: str) -> Optional[str]:
     if not raw:
@@ -85,13 +86,29 @@ def extract_phone(text: str) -> Optional[str]:
         return None
     return normalize_phone(m.group(0))
 
-def tg_display_name(update: Update) -> str:
+def extract_map_link(text: str) -> Optional[str]:
+    """Выцепляем ссылку на карту (google/yandex/waze/osm/2gis/what3words)."""
+    if not text:
+        return None
+    m = URL_RE.search(text)
+    if not m:
+        return None
+    url = m.group(0)
+    if re.search(r"(google\.com/maps|maps\.app\.goo\.gl|yandex\.(ru|com)/maps|waze\.com|osm\.org|openstreetmap|2gis|what3words)", url, re.I):
+        return url
+    return None
+
+def friendly_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> str:
+    # сначала берём сохранённое имя
+    if context.user_data.get("name"):
+        return context.user_data["name"]
+    # затем — из Telegram-профиля (если есть)
     u = update.effective_user
     if not u:
-        return "Клиент"
+        return ""
     parts = [u.first_name or "", u.last_name or ""]
     name = " ".join(p for p in parts if p).strip()
-    return name or (u.username or f"id{u.id}")
+    return name
 
 # мини-история диалога
 MAX_HISTORY = 6
@@ -117,8 +134,8 @@ def is_diy_request(text: str) -> bool:
 
 DIY_SAFE_REPLY = (
     "Понимаю желание разобраться самому, но из соображений безопасности и гарантии мы не даём инструкции по "
-    "самостоятельному ремонту. Могу предложить быструю диагностику, запись в сервис и (при необходимости) эвакуатор. "
-    "Опишите, пожалуйста, симптомы — и я оформлю обращение."
+    "самостоятельному ремонту. Предлагаю быструю диагностику, запись в сервис и (при необходимости) эвакуатор. "
+    "Коротко опишите симптомы — и я оформлю обращение."
 )
 
 # Фильтр «не обещай запись», пока нет заявки
@@ -143,9 +160,10 @@ CANON = {
     # эвакуатор / доставка
     "эвакуатор": "эвакуатор", "эвакуация": "эвакуатор", "забор": "эвакуатор",
     "доставка": "эвакуатор", "pickup": "эвакуатор", "пикап": "эвакуатор", "tow": "эвакуатор",
-    # адрес / где
+    # адрес / где / локация
     "адрес": "адрес", "где": "адрес", "находитесь": "адрес", "локация": "адрес",
     "местоположение": "адрес", "куда": "адрес", "как": "адрес", "доехать": "адрес", "добраться": "адрес",
+    "карта": "адрес", "ссылку": "адрес", "ссылка": "адрес", "пин": "адрес", "координаты": "адрес",
     # диагностика
     "диагностика": "диагностика", "осмотр": "диагностика", "проверка": "диагностика",
     # запчасти
@@ -164,7 +182,7 @@ def default_kb() -> List[Dict[str, Any]]:
         },
         {
             "title": "Адрес и как добраться",
-            "tags": ["адрес", "где", "находимся", "локация", "как добраться", "местоположение", "карта", "локацию", "куда ехать"],
+            "tags": ["адрес", "где", "находимся", "локация", "как добраться", "местоположение", "карта", "куда ехать"],
             "answer": f"Наш адрес: {COMPANY_ADDRESS}. Город: {CITY}. Если неудобно ехать — можем забрать мотоцикл по городу за {CURRENCY}{TOW_PRICE_LOCAL}."
         },
         {
@@ -234,7 +252,7 @@ def quick_intent_answer(text: str) -> Optional[str]:
     q = set(canonical_tokens(text))
     if "эвакуатор" in q:
         return (f"По {CITY} забор/доставка мотоцикла — фикс {CURRENCY}{TOW_PRICE_LOCAL}. "
-                f"За город — по расстоянию. Напишите район/адрес и удобное время — всё организуем.")
+                f"За город — по расстоянию. Скиньте район/адрес и удобное время — всё организуем.")
     if "адрес" in q:
         return (f"Наш адрес: {COMPANY_ADDRESS}. Работаем: {WORKING_HOURS}. "
                 f"Если неудобно ехать — можем забрать мотоцикл по городу за {CURRENCY}{TOW_PRICE_LOCAL}.")
@@ -287,14 +305,15 @@ RO = ROAppClient(ROAPP_API_KEY, ROAPP_BASE_URL) if ROAPP_API_KEY else None
 # =========================
 async def ai_reply(user_text: str, history: List[Dict[str, str]]) -> str:
     if not OPENAI_API_KEY:
-        return "Расскажите чуть подробнее, что случилось — подскажу и предложу следующий шаг. Если понадобится, оформлю обращение."
+        return "Понимаю. Расскажите чуть подробнее — что случилось и какая модель? Если нужно, оформлю обращение."
 
     system = (
-        "Ты дружелюбный менеджер сервиса {brand}. Отвечай по-русски, тепло и по делу, 1–3 предложения.\n"
+        "Ты дружелюбный менеджер сервиса {brand}. Отвечай естественно и тепло, 1–3 предложения. "
+        "Никогда не выдумывай имя клиента: если имя неизвестно — не используй обращение по имени. "
         "Строгий запрет: не давай инструкций по самостоятельному ремонту/разборке/настройке. "
-        "Вместо этого предлагай диагностику/запись/эвакуатор.\n"
-        "Если канал WhatsApp — номер уже известен, проси только имя (один раз). "
-        "Используй факты из блока 'Контекст', если они подходят."
+        "Вместо этого предлагай диагностику/запись/эвакуатор. "
+        "Если канал WhatsApp — номер у нас уже есть, можно мягко спросить имя один раз. "
+        "Используй факты из блока 'Контекст', если подходят."
     ).format(brand=COMPANY_NAME)
 
     kb_ctx = kb_search(user_text)
@@ -317,7 +336,6 @@ async def ai_reply(user_text: str, history: List[Dict[str, str]]) -> str:
             if r.status_code == 200:
                 data = r.json()
                 text = (data["choices"][0]["message"]["content"] or "").strip()[:1200]
-                # подстрахуемся от DIY-шагов
                 if is_diy_request(text) or re.search(r"\b(открут|сним|установ|замен|подключ|раскрут|прижми|подтян)\w*\b", text.lower()):
                     return DIY_SAFE_REPLY
                 return text
@@ -337,7 +355,7 @@ WELCOME_TG = (
 )
 WELCOME_WA = (
     f"Привет! Я менеджер {COMPANY_NAME}. Расскажите, что случилось — подскажу. "
-    "Кстати, как к вам обращаться?"
+    "Можете также отправить пин или ссылку на местоположение для эвакуации."
 )
 
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -367,11 +385,21 @@ def maybe_phone_hint(context: ContextTypes.DEFAULT_TYPE) -> str:
     context.user_data["hint_count"] = cnt + 1
     return random.choice(PHONE_HINTS) if cnt % 3 == 0 else ""
 
+# --- обработка геолокации (кнопка «Отправить местоположение» в TG)
+async def handle_location(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    loc = update.message.location
+    context.user_data["pickup_location"] = {"lat": loc.latitude, "lon": loc.longitude}
+    name = friendly_name(update, context)
+    who = f", {name}" if name else ""
+    txt = (f"Отлично{who}! Вижу точку на карте. По {CITY} эвакуатор — фикс {CURRENCY}{TOW_PRICE_LOCAL}. "
+           "Подскажите, когда удобно забрать мотоцикл?")
+    await update.message.reply_text(txt)
+
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (update.message.text or "").strip()
     hist: List[Dict[str, str]] = context.user_data.get("hist") or []
 
-    # ждём имя (только для WhatsApp)
+    # если ждём имя (WA)
     if context.user_data.get("await_name"):
         if looks_like_name(text):
             context.user_data["name"] = text
@@ -389,10 +417,21 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(DIY_SAFE_REPLY)
         return
 
+    # 1а) если прислали ссылку на карту — принимаем и спрашиваем время
+    mlink = extract_map_link(text)
+    if mlink:
+        context.user_data["pickup_link"] = mlink
+        name = friendly_name(update, context)
+        who = f", {name}" if name else ""
+        msg = (f"Спасибо{who}! Получил ссылку на локацию. По {CITY} заберём за {CURRENCY}{TOW_PRICE_LOCAL}. "
+               "Когда удобно забрать мотоцикл?")
+        await update.message.reply_text(msg)
+        return
+
     # 2) Телеграм: если встретили номер — создаём лид
     phone = extract_phone(text) if CHANNEL == "telegram" else None
     if phone:
-        name = context.user_data.get("name") or tg_display_name(update)
+        name = context.user_data.get("name") or (friendly_name(update, context) or "Клиент")
         last_msgs = "\n".join([x["content"] for x in hist[-3:] if x["role"] == "user"])
         context.user_data["phone"] = phone
         if RO is None:
@@ -400,15 +439,12 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"Принял номер: <b>{phone}</b>. Зафиксировал запрос.",
                 parse_mode=ParseMode.HTML,
             )
-            if CHANNEL == "whatsapp" and not context.user_data.get("name"):
-                context.user_data["await_name"] = True
-                await update.message.reply_text("Кстати, как к вам обращаться?")
             return
         try:
             inquiry = await RO.create_inquiry(
                 contact_phone=phone,
                 contact_name=name,
-                title="Запрос на ремонт/запчасти",
+                title="Запрос на эвакуацию/ремонт",
                 description=f"Источник: {ROAPP_SOURCE}. Недавние сообщения:\n{last_msgs}"[:900],
                 location_id=int(ROAPP_LOCATION_ID) if ROAPP_LOCATION_ID else None,
                 channel=ROAPP_SOURCE,
@@ -430,9 +466,10 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"❌ Техническая ошибка: {e}")
             return
 
-    # 2а) Быстрые ответы по намерению (эвакуатор/адрес)
+    # 2а) Быстрые ответы (эвакуатор/адрес)
     qa = quick_intent_answer(text)
     if qa:
+        # в WhatsApp, если имени ещё нет — попросим один раз
         if CHANNEL == "whatsapp" and not context.user_data.get("name"):
             context.user_data["await_name"] = True
             await update.message.reply_text(f"{qa}\n\nКак к вам обращаться?")
@@ -459,8 +496,12 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(final)
 
 async def catch_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.message and update.message.text:
-        await handle_text(update, context)
+    # подстрахуемся: если это текст — в текстовый хэндлер; если локация — в локационный
+    if update.message:
+        if update.message.location:
+            await handle_location(update, context)
+        elif update.message.text:
+            await handle_text(update, context)
 
 # =========================
 # AIOHTTP web app (Telegram + CRM + healthz)
@@ -502,7 +543,8 @@ async def main():
 
     application.add_handler(CommandHandler("start", start_cmd))
     application.add_handler(CommandHandler("id", id_cmd))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, catch_all))
+    # единый обработчик: и текст, и локации
+    application.add_handler(MessageHandler(~filters.COMMAND, catch_all))
 
     aio = make_aiohttp_app(application)
     runner = web.AppRunner(aio)
@@ -516,7 +558,7 @@ async def main():
     await application.bot.set_webhook(
         url=telegram_url,
         secret_token=BOT_SECRET,
-        allowed_updates=["message"],  # только сообщения
+        allowed_updates=["message"],  # локации тоже приходят как message
     )
 
     async with application:
