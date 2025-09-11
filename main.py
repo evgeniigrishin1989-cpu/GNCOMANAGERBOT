@@ -4,7 +4,7 @@ import logging
 import os
 import re
 import random
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict, Any
 
 import httpx
 from aiohttp import web
@@ -46,10 +46,18 @@ OPENAI_MODEL    = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 # КАНАЛ: telegram / whatsapp
 CHANNEL         = os.getenv("CHANNEL", "telegram").lower().strip()
 
+# «паспорт» компании для ответов
+COMPANY_NAME    = os.getenv("COMPANY_NAME", "GNCO")
+COMPANY_ADDRESS = os.getenv("COMPANY_ADDRESS", "ул. Примерная, 1")
+WORKING_HOURS   = os.getenv("WORKING_HOURS", "Ежедневно 09:00–18:00")
+CITY            = os.getenv("CITY", "Кейптаун")
+WHATSAPP_NUMBER = os.getenv("WHATSAPP_NUMBER", "+27XXXXXXXXXX")
+
+# CRM (RO App)
 ROAPP_API_KEY     = os.getenv("ROAPP_API_KEY")
 ROAPP_BASE_URL    = os.getenv("ROAPP_BASE_URL", "https://api.roapp.io")
 ROAPP_LOCATION_ID = os.getenv("ROAPP_LOCATION_ID")
-ROAPP_SOURCE      = os.getenv("ROAPP_SOURCE", "Telegram")
+ROAPP_SOURCE      = os.getenv("ROAPP_SOURCE", "Telegram" if CHANNEL == "telegram" else "WhatsApp")
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is not set")
@@ -78,12 +86,12 @@ def extract_phone(text: str) -> Optional[str]:
 def tg_display_name(update: Update) -> str:
     u = update.effective_user
     if not u:
-        return "Telegram User"
+        return "Клиент"
     parts = [u.first_name or "", u.last_name or ""]
     name = " ".join(p for p in parts if p).strip()
     return name or (u.username or f"id{u.id}")
 
-# Мини-история диалога
+# маленькая история
 MAX_HISTORY = 6
 def push_history(store: List[Dict[str, str]], role: str, content: str) -> None:
     if content:
@@ -91,22 +99,109 @@ def push_history(store: List[Dict[str, str]], role: str, content: str) -> None:
         while len(store) > MAX_HISTORY:
             store.pop(0)
 
-# Напоминания — показываем только в Telegram и только если номера ещё нет
-PHONE_HINTS = [
-    "Если хотите оформить обращение — пришлите номер в формате +XXXXXXXXXXX, всё сделаю.",
-    "Готов оформить заявку — просто пришлите номер телефона в формате +XXXXXXXXXXX.",
-    "Чтобы закрепить запрос и передать мастеру, нужен номер в формате +XXXXXXXXXXX.",
+# =========================
+# БАЗА ЗНАНИЙ (KB)
+# =========================
+def default_kb() -> List[Dict[str, Any]]:
+    return [
+        {
+            "title": "Часы работы",
+            "tags": ["часы", "время", "режим", "работы", "когда", "открыты", "выходные"],
+            "answer": f"{COMPANY_NAME} работает: {WORKING_HOURS}. Адрес: {COMPANY_ADDRESS}."
+        },
+        {
+            "title": "Адрес и как добраться",
+            "tags": ["адрес", "где", "находимся", "локация", "как добраться", "местоположение", "карта", "локацию"],
+            "answer": f"Мы находимся: {COMPANY_ADDRESS}, {CITY}. Можем организовать эвакуатор — напишите, если нужно."
+        },
+        {
+            "title": "Забор мотоцикла / эвакуатор",
+            "tags": ["эвакуатор", "забрать", "забор", "доставка", "привезти", "самовывоз"],
+            "answer": "Организуем забор мотоцикла эвакуатором. Сориентируем по стоимости и времени по адресу/району."
+        },
+        {
+            "title": "Сроки ремонта",
+            "tags": ["срок", "когда", "сколько времени", "готовность", "очередь", "время"],
+            "answer": "Сроки зависят от загрузки и наличия запчастей. После первичной диагностики дадим точный план и сроки."
+        },
+        {
+            "title": "Диагностика и стоимость",
+            "tags": ["сколько стоит", "цена", "стоимость", "диагностика", "прайс", "расценки"],
+            "answer": "Первично осматриваем и согласовываем работы/бюджет перед началом. Финальная стоимость — после диагностики."
+        },
+        {
+            "title": "Запчасти и наличие",
+            "tags": ["запчасти", "наличие", "детали", "комплектующие", "каталог", "заказ"],
+            "answer": "Работаем с проверенными поставщиками. Подберём детали под VIN/модель; при необходимости заказ."
+        },
+        {
+            "title": "Контакты",
+            "tags": ["контакты", "связаться", "номер", "телефон", "ватсап", "whatsapp"],
+            "answer": f"Быстрее всего — WhatsApp {WHATSAPP_NUMBER}. Также можно написать сюда в чат."
+        },
+        {
+            "title": "Гарантия и качество",
+            "tags": ["гарантия", "качество", "возврат", "повторный ремонт"],
+            "answer": "Даем гарантию на выполненные работы и используемые запчасти. Все детали согласуем заранее."
+        },
+    ]
+
+def load_external_kb(path: str = "kb.json") -> List[Dict[str, Any]]:
+    try:
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, list):
+                return data
+    except Exception as e:
+        log.warning("KB load error: %s", e)
+    return []
+
+KB: List[Dict[str, Any]] = default_kb() + load_external_kb("kb.json")
+
+def tokens_ru(text: str) -> List[str]:
+    t = text.lower().replace("ё", "е")
+    t = re.sub(r"[^a-zа-я0-9\s\-]+", " ", t)
+    return [x for x in t.split() if x]
+
+def kb_search(query: str) -> Optional[str]:
+    """Простейший лексический поиск по KB."""
+    if not query:
+        return None
+    q = set(tokens_ru(query))
+    best_score, best_answer = 0, None
+    for item in KB:
+        tags = " ".join(item.get("tags", [])) + " " + item.get("title", "")
+        t = set(tokens_ru(tags))
+        score = len(q & t)
+        if score > best_score:
+            best_score = score
+            best_answer = item.get("answer")
+    # эмпирический порог совпадений
+    return best_answer if best_score >= 2 else None
+
+# =========================
+# Детектор DIY (самостоятельный ремонт)
+# =========================
+DIY_PATTERNS = [
+    r"\bкак\s+(починить|ремонтировать|заменить|разобрать|снять|поставить|натянуть|отрегулировать)\b",
+    r"\bинструкц(ия|ии)\b",
+    r"\bпошагов(о|ая)\b",
+    r"\bсвоими\s+руками\b",
+    r"\bчто\s+нужно\s+сделать\b",
+    r"\bкакие\s+инструменты\b",
+    r"\bгайд\b",
 ]
-def maybe_phone_hint(context: ContextTypes.DEFAULT_TYPE) -> str:
-    if CHANNEL == "whatsapp":
-        return ""  # в WhatsApp номер уже есть → не просим
-    if context.user_data.get("phone"):
-        return ""  # уже знаем номер
-    cnt = int(context.user_data.get("hint_count", 0))
-    context.user_data["hint_count"] = cnt + 1
-    if cnt % 3 == 0:
-        return random.choice(PHONE_HINTS)
-    return ""
+
+def is_diy_request(text: str) -> bool:
+    t = (text or "").lower()
+    return any(re.search(p, t) for p in DIY_PATTERNS)
+
+DIY_SAFE_REPLY = (
+    "Понимаю желание разобраться самому, но из соображений безопасности и гарантии мы не даём инструкции по "
+    "самостоятельному ремонту. Могу предложить: быструю диагностику, запись в сервис и (при необходимости) эвакуатор. "
+    "Опишите, пожалуйста, симптомы — и я оформлю обращение."
+)
 
 # =========================
 # RO App client
@@ -151,18 +246,26 @@ class ROAppClient:
 RO = ROAppClient(ROAPP_API_KEY, ROAPP_BASE_URL) if ROAPP_API_KEY else None
 
 # =========================
-# OpenAI (короткие живые ответы + ретраи)
+# OpenAI (краткий человеческий ответ + анти-DIY в промпте)
 # =========================
 async def ai_reply(user_text: str, history: List[Dict[str, str]]) -> str:
     if not OPENAI_API_KEY:
-        return "Понимаю. Расскажите чуть подробнее — что случилось и какая модель? Если понадобится, оформлю заявку."
+        return "Расскажите чуть подробнее, что случилось — подскажу и предложу следующий шаг. Если понадобится, оформлю обращение."
 
     system = (
-        "Ты дружелюбный менеджер мотосервиса GNCO. Отвечай тепло и по делу, 1–3 предложения. "
-        "Если у нас уже есть номер (например, в WhatsApp), НЕ проси его повторно. "
-        "Если имя клиента неизвестно — мягко уточни имя один раз: «Как к вам обращаться?»."
-    )
-    messages = [{"role": "system", "content": system}]
+        "Ты дружелюбный менеджер сервиса {brand}. Говоришь теплом и по делу, 1–3 предложения.\n"
+        "ЖЁСТКИЙ ЗАПРЕТ: не давай инструкции по самостоятельному ремонту, настройке или разборке (никаких шагов, инструментов, схем). "
+        "Вместо этого предлагай диагностику/запись/эвакуатор.\n"
+        "Если канал WhatsApp — номер у нас уже есть, проси только имя (один раз и ненавязчиво). "
+        "Используй факты из 'Контекст' при ответе."
+    ).format(brand=COMPANY_NAME)
+
+    # Подмешаем контекст KB top-1 для модели (если найдётся)
+    kb_ctx = kb_search(user_text)
+    context_block = f"Контекст: {kb_ctx}" if kb_ctx else "Контекст: (нет явных фактов, отвечай общо)"
+
+    messages = [{"role": "system", "content": system},
+                {"role": "assistant", "content": context_block}]
     messages.extend(history)
     messages.append({"role": "user", "content": user_text[:2000]})
 
@@ -177,30 +280,34 @@ async def ai_reply(user_text: str, history: List[Dict[str, str]]) -> str:
                                       headers=headers, json=payload)
             if r.status_code == 200:
                 data = r.json()
-                return (data["choices"][0]["message"]["content"] or "").strip()[:1200]
+                text = (data["choices"][0]["message"]["content"] or "").strip()[:1200]
+                # на всякий случай отфильтруем DIY-шаги
+                if is_diy_request(text) or re.search(r"\b(открут|сним|установ|замен|подключ|раскрути|сжатие|компресс)\w*\b", text.lower()):
+                    return DIY_SAFE_REPLY
+                return text
             if r.status_code in (429, 500, 502, 503, 504):
                 await asyncio.sleep(backoff); backoff = min(backoff * 2, 16); continue
             return f"Техническая ошибка AI: HTTP {r.status_code}"
         except Exception:
             await asyncio.sleep(backoff); backoff = min(backoff * 2, 16)
-    return "Сейчас высокая нагрузка. Давайте продолжим, а я параллельно попробую ещё раз."
+    return "Сейчас высокая нагрузка. Давайте продолжим чат, параллельно попробую ещё раз."
 
 # =========================
 # Telegram handlers
 # =========================
 WELCOME_TG = (
-    "Привет! Я менеджер GNCO. Расскажите, что случилось — подскажу. "
+    "Привет! Я менеджер {brand}. Расскажите, что случилось — подскажу. "
     "Если готовы сразу оформить, пришлите номер в формате +27XXXXXXXXXX."
-)
+).format(brand=COMPANY_NAME)
+
 WELCOME_WA = (
-    "Привет! Я менеджер GNCO. Расскажите, что случилось — подскажу. "
-    "Кстати, как к вам обращаться?"
+    "Привет! Я менеджер {brand}. Расскажите, что случилось — подскажу. "
+    "Кстати, как к вам обращаться?".format(brand=COMPANY_NAME)
 )
 
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["hist"] = []
     context.user_data["hint_count"] = 0
-    # В WhatsApp номер у нас уже есть — спросим имя
     await update.message.reply_text(WELCOME_WA if CHANNEL == "whatsapp" else WELCOME_TG)
 
 async def id_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -213,36 +320,51 @@ def looks_like_name(text: str) -> bool:
     t = text.strip()
     return bool(t) and not extract_phone(t) and len(t.split()) <= 4 and len(t) <= 40
 
+PHONE_HINTS = [
+    "Если хотите оформить обращение — пришлите номер в формате +XXXXXXXXXXX, всё сделаю.",
+    "Готов оформить заявку — просто пришлите номер телефона в формате +XXXXXXXXXXX.",
+    "Чтобы закрепить запрос и передать мастеру, нужен номер в формате +XXXXXXXXXXX.",
+]
+def maybe_phone_hint(context: ContextTypes.DEFAULT_TYPE) -> str:
+    if CHANNEL == "whatsapp" or context.user_data.get("phone"):
+        return ""
+    cnt = int(context.user_data.get("hint_count", 0))
+    context.user_data["hint_count"] = cnt + 1
+    return random.choice(PHONE_HINTS) if cnt % 3 == 0 else ""
+
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (update.message.text or "").strip()
     hist: List[Dict[str, str]] = context.user_data.get("hist") or []
 
-    # Если ждём имени — сохраняем и подтверждаем
+    # если ждём имя (WA)
     if context.user_data.get("await_name"):
         if looks_like_name(text):
             context.user_data["name"] = text
             context.user_data["await_name"] = False
             await update.message.reply_text(f"Спасибо, {text}! Продолжайте — я помогу.")
-            return
         else:
             await update.message.reply_text("Как к вам обращаться? Имя можно одним словом 🙂")
-            return
+        return
 
     push_history(hist, "user", text)
     context.user_data["hist"] = hist
 
-    # Если в тексте есть номер — создаём заявку (актуально для Telegram)
-    phone = extract_phone(text)
+    # DIY запрет — перехватываем сразу
+    if is_diy_request(text):
+        await update.message.reply_text(DIY_SAFE_REPLY)
+        return
+
+    # если видим номер (актуально для Telegram) — создаём лид
+    phone = extract_phone(text) if CHANNEL == "telegram" else None
     if phone:
         name = context.user_data.get("name") or tg_display_name(update)
         last_msgs = "\n".join([x["content"] for x in hist[-3:] if x["role"] == "user"])
-        context.user_data["phone"] = phone  # запомним
+        context.user_data["phone"] = phone
         if RO is None:
             await update.message.reply_text(
-                f"Принял номер: <b>{phone}</b>. Ключ CRM не настроен, но запрос зафиксирован.",
+                f"Принял номер: <b>{phone}</b>. Зафиксировал запрос.",
                 parse_mode=ParseMode.HTML,
             )
-            # если имени нет — спросим
             if CHANNEL == "whatsapp" and not context.user_data.get("name"):
                 context.user_data["await_name"] = True
                 await update.message.reply_text("Кстати, как к вам обращаться?")
@@ -252,21 +374,16 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 contact_phone=phone,
                 contact_name=name,
                 title="Запрос на ремонт/запчасти",
-                description=f"Источник: {ROAPP_SOURCE}.\nНедавние сообщения:\n{last_msgs}"[:900],
+                description=f"Источник: {ROAPP_SOURCE}. Недавние сообщения:\n{last_msgs}"[:900],
                 location_id=int(ROAPP_LOCATION_ID) if ROAPP_LOCATION_ID else None,
                 channel=ROAPP_SOURCE,
             )
             context.user_data["inquiry_id"] = inquiry.get("id")
             await update.message.reply_text(
                 "Готово! ✅ Оформил обращение.\n"
-                f"Номер: <b>{phone}</b>\nИмя: <b>{name}</b>\n"
-                "Мастер свяжется и подскажет по срокам и стоимости.",
+                f"Номер: <b>{phone}</b>\nИмя: <b>{name}</b>",
                 parse_mode=ParseMode.HTML,
             )
-            # если имени не знает — спросит один раз
-            if CHANNEL == "whatsapp" and not context.user_data.get("name"):
-                context.user_data["await_name"] = True
-                await update.message.reply_text("Как к вам обращаться?")
             return
         except httpx.HTTPStatusError as e:
             await update.message.reply_text(
@@ -278,15 +395,18 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"❌ Техническая ошибка: {e}")
             return
 
-    # **Главная логика**: в WhatsApp не просим номер, уточняем имя (один раз)
-    if CHANNEL == "whatsapp" and not context.user_data.get("name"):
-        context.user_data["await_name"] = True
-        reply = await ai_reply(text, hist)
-        push_history(hist, "assistant", reply)
-        await update.message.reply_text(f"{reply}\n\nКак к вам обращаться?")
+    # БАЗА ЗНАНИЙ → если нашли — отвечаем ею
+    kb_answer = kb_search(text)
+    if kb_answer:
+        # в WA попросим имя один раз
+        if CHANNEL == "whatsapp" and not context.user_data.get("name"):
+            context.user_data["await_name"] = True
+            await update.message.reply_text(f"{kb_answer}\n\nКак к вам обращаться?")
+        else:
+            await update.message.reply_text(kb_answer)
         return
 
-    # В Telegram — даём AI-ответ и изредка напоминаем про номер
+    # Иначе — AI
     reply = await ai_reply(text, hist)
     push_history(hist, "assistant", reply)
     hint = maybe_phone_hint(context)
@@ -369,4 +489,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-
