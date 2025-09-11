@@ -46,17 +46,14 @@ OPENAI_MODEL    = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 # КАНАЛ: telegram / whatsapp
 CHANNEL         = os.getenv("CHANNEL", "telegram").lower().strip()
 
-# «паспорт» компании и цены
+# Паспорт компании и цены
 COMPANY_NAME    = os.getenv("COMPANY_NAME", "GNCO")
 COMPANY_ADDRESS = os.getenv("COMPANY_ADDRESS", "94 Hurd Street, Newton Park, PE")
 CITY            = os.getenv("CITY", "Port Elizabeth (Gqeberha)")
-WORKING_HOURS   = os.getenv("WORKING_HOURS", "Ежедневно 09:00–17:00")
+WORKING_HOURS   = os.getenv("WORKING_HOURS", "Ежедневно 09:00–18:00")
 WHATSAPP_NUMBER = os.getenv("WHATSAPP_NUMBER", "+27XXXXXXXXXX")
-
-# эвакуатор/доставка по городу
-CURRENCY        = os.getenv("CURRENCY", "R")     # валюта: R (ZAR)
-TOW_PRICE_LOCAL = os.getenv("TOW_PRICE_LOCAL", "300")  # фикс за городскую доставку
-
+CURRENCY        = os.getenv("CURRENCY", "R")
+TOW_PRICE_LOCAL = os.getenv("TOW_PRICE_LOCAL", "300")  # фикс по городу
 
 # CRM (RO App)
 ROAPP_API_KEY     = os.getenv("ROAPP_API_KEY")
@@ -96,7 +93,7 @@ def tg_display_name(update: Update) -> str:
     name = " ".join(p for p in parts if p).strip()
     return name or (u.username or f"id{u.id}")
 
-# маленькая история
+# мини-история диалога
 MAX_HISTORY = 6
 def push_history(store: List[Dict[str, str]], role: str, content: str) -> None:
     if content:
@@ -104,9 +101,60 @@ def push_history(store: List[Dict[str, str]], role: str, content: str) -> None:
         while len(store) > MAX_HISTORY:
             store.pop(0)
 
+# Запрет DIY (самостоятельный ремонт)
+DIY_PATTERNS = [
+    r"\bкак\s+(починить|ремонтировать|заменить|разобрать|снять|поставить|натянуть|отрегулировать)\b",
+    r"\bинструкц(ия|ии)\b",
+    r"\bпошагов(о|ая)\b",
+    r"\bсвоими\s+руками\b",
+    r"\bчто\s+нужно\s+сделать\b",
+    r"\bкакие\s+инструменты\b",
+    r"\bгайд\b",
+]
+def is_diy_request(text: str) -> bool:
+    t = (text or "").lower()
+    return any(re.search(p, t) for p in DIY_PATTERNS)
+
+DIY_SAFE_REPLY = (
+    "Понимаю желание разобраться самому, но из соображений безопасности и гарантии мы не даём инструкции по "
+    "самостоятельному ремонту. Могу предложить быструю диагностику, запись в сервис и (при необходимости) эвакуатор. "
+    "Опишите, пожалуйста, симптомы — и я оформлю обращение."
+)
+
+# Фильтр «не обещай запись», пока нет заявки
+BOOKING_PHRASES = r"(запис(ал|ываю)|оформ(ил|ляю)|постав(ил|лю)\s+в\s+расписание|созда(л|ю)\s+заявк)"
+def sanitize_ai_reply(text: str, has_inquiry: bool) -> str:
+    if has_inquiry:
+        return text
+    return re.sub(BOOKING_PHRASES + r"[^.!?]*", "", text, flags=re.I).strip()
+
 # =========================
 # БАЗА ЗНАНИЙ (KB)
 # =========================
+def tokens_ru(text: str) -> List[str]:
+    t = (text or "").lower().replace("ё", "е")
+    t = re.sub(r"[^a-zа-я0-9\s\-]+", " ", t)
+    return [x for x in t.split() if x]
+
+# Синонимы → канонические токены
+CANON = {
+    # цена
+    "сколько": "цена", "стоит": "цена", "стоимость": "цена", "цена": "цена", "прайс": "цена",
+    # эвакуатор / доставка
+    "эвакуатор": "эвакуатор", "эвакуация": "эвакуатор", "забор": "эвакуатор",
+    "доставка": "эвакуатор", "pickup": "эвакуатор", "пикап": "эвакуатор", "tow": "эвакуатор",
+    # адрес / где
+    "адрес": "адрес", "где": "адрес", "находитесь": "адрес", "локация": "адрес",
+    "местоположение": "адрес", "куда": "адрес", "как": "адрес", "доехать": "адрес", "добраться": "адрес",
+    # диагностика
+    "диагностика": "диагностика", "осмотр": "диагностика", "проверка": "диагностика",
+    # запчасти
+    "запчасти": "запчасти", "детали": "запчасти", "комплектующие": "запчасти", "наличие": "запчасти",
+}
+def canonical_tokens(text: str) -> List[str]:
+    toks = tokens_ru(text)
+    return [CANON.get(t, t) for t in toks]
+
 def default_kb() -> List[Dict[str, Any]]:
     return [
         {
@@ -116,13 +164,13 @@ def default_kb() -> List[Dict[str, Any]]:
         },
         {
             "title": "Адрес и как добраться",
-            "tags": ["адрес", "где", "находимся", "локация", "как добраться", "местоположение", "карта", "локацию"],
-            "answer": f"Мы находимся: {COMPANY_ADDRESS}, {CITY}. Можем организовать эвакуатор — напишите, если нужно."
+            "tags": ["адрес", "где", "находимся", "локация", "как добраться", "местоположение", "карта", "локацию", "куда ехать"],
+            "answer": f"Наш адрес: {COMPANY_ADDRESS}. Город: {CITY}. Если неудобно ехать — можем забрать мотоцикл по городу за {CURRENCY}{TOW_PRICE_LOCAL}."
         },
         {
-            "title": "Забор мотоцикла / эвакуатор",
-            "tags": ["эвакуатор", "забрать", "забор", "доставка", "привезти", "самовывоз"],
-            "answer": "Организуем забор мотоцикла эвакуатором. Сориентируем по стоимости и времени по адресу/району."
+            "title": "Забор/доставка мотоцикла по городу",
+            "tags": ["эвакуатор", "доставка", "забор", "по городу", "стоимость", "цена", "вызов", "эвакуация", "pickup", "tow"],
+            "answer": f"В пределах {CITY} забор/доставка мотоцикла стоит фиксировано {CURRENCY}{TOW_PRICE_LOCAL}. За город — по расстоянию. Напишите район/адрес и время — всё организуем."
         },
         {
             "title": "Сроки ремонта",
@@ -131,23 +179,23 @@ def default_kb() -> List[Dict[str, Any]]:
         },
         {
             "title": "Диагностика и стоимость",
-            "tags": ["сколько стоит", "цена", "стоимость", "диагностика", "прайс", "расценки"],
-            "answer": "Первично осматриваем и согласовываем работы/бюджет перед началом. Финальная стоимость — после диагностики."
+            "tags": ["сколько стоит", "цена", "стоимость", "диагностика", "прайс", "расценки", "осмотр"],
+            "answer": "Перед началом работ делаем осмотр и согласовываем бюджет. Финальная стоимость известна после диагностики."
         },
         {
             "title": "Запчасти и наличие",
-            "tags": ["запчасти", "наличие", "детали", "комплектующие", "каталог", "заказ"],
-            "answer": "Работаем с проверенными поставщиками. Подберём детали под VIN/модель; при необходимости заказ."
+            "tags": ["запчасти", "наличие", "детали", "комплектующие", "каталог", "заказ", "vin"],
+            "answer": "Подберём детали по VIN/модели. Работаем с проверенными поставщиками; при необходимости закажем."
         },
         {
             "title": "Контакты",
             "tags": ["контакты", "связаться", "номер", "телефон", "ватсап", "whatsapp"],
-            "answer": f"Быстрее всего — WhatsApp {WHATSAPP_NUMBER}. Также можно написать сюда в чат."
+            "answer": f"Быстрее всего — WhatsApp {WHATSAPP_NUMBER}. Можно писать и сюда в чат."
         },
         {
             "title": "Гарантия и качество",
             "tags": ["гарантия", "качество", "возврат", "повторный ремонт"],
-            "answer": "Даем гарантию на выполненные работы и используемые запчасти. Все детали согласуем заранее."
+            "answer": "Даем гарантию на выполненные работы и использованные запчасти. Все согласуем заранее."
         },
     ]
 
@@ -164,49 +212,33 @@ def load_external_kb(path: str = "kb.json") -> List[Dict[str, Any]]:
 
 KB: List[Dict[str, Any]] = default_kb() + load_external_kb("kb.json")
 
-def tokens_ru(text: str) -> List[str]:
-    t = text.lower().replace("ё", "е")
-    t = re.sub(r"[^a-zа-я0-9\s\-]+", " ", t)
-    return [x for x in t.split() if x]
-
 def kb_search(query: str) -> Optional[str]:
-    """Простейший лексический поиск по KB."""
+    """Поиск по KB: канонизируем синонимы, усиливаем эвакуатор/адрес."""
     if not query:
         return None
-    q = set(tokens_ru(query))
+    q = set(canonical_tokens(query))
     best_score, best_answer = 0, None
     for item in KB:
-        tags = " ".join(item.get("tags", [])) + " " + item.get("title", "")
-        t = set(tokens_ru(tags))
+        tags_text = " ".join(item.get("tags", [])) + " " + item.get("title", "")
+        t = set(canonical_tokens(tags_text))
         score = len(q & t)
         if score > best_score:
             best_score = score
             best_answer = item.get("answer")
-    # эмпирический порог совпадений
+    if ("адрес" in q or "эвакуатор" in q) and best_score >= 1:
+        return best_answer
     return best_answer if best_score >= 2 else None
 
-# =========================
-# Детектор DIY (самостоятельный ремонт)
-# =========================
-DIY_PATTERNS = [
-    r"\bкак\s+(починить|ремонтировать|заменить|разобрать|снять|поставить|натянуть|отрегулировать)\b",
-    r"\bинструкц(ия|ии)\b",
-    r"\bпошагов(о|ая)\b",
-    r"\bсвоими\s+руками\b",
-    r"\bчто\s+нужно\s+сделать\b",
-    r"\bкакие\s+инструменты\b",
-    r"\bгайд\b",
-]
-
-def is_diy_request(text: str) -> bool:
-    t = (text or "").lower()
-    return any(re.search(p, t) for p in DIY_PATTERNS)
-
-DIY_SAFE_REPLY = (
-    "Понимаю желание разобраться самому, но из соображений безопасности и гарантии мы не даём инструкции по "
-    "самостоятельному ремонту. Могу предложить: быструю диагностику, запись в сервис и (при необходимости) эвакуатор. "
-    "Опишите, пожалуйста, симптомы — и я оформлю обращение."
-)
+# Быстрые ответы без AI (интенты)
+def quick_intent_answer(text: str) -> Optional[str]:
+    q = set(canonical_tokens(text))
+    if "эвакуатор" in q:
+        return (f"По {CITY} забор/доставка мотоцикла — фикс {CURRENCY}{TOW_PRICE_LOCAL}. "
+                f"За город — по расстоянию. Напишите район/адрес и удобное время — всё организуем.")
+    if "адрес" in q:
+        return (f"Наш адрес: {COMPANY_ADDRESS}. Работаем: {WORKING_HOURS}. "
+                f"Если неудобно ехать — можем забрать мотоцикл по городу за {CURRENCY}{TOW_PRICE_LOCAL}.")
+    return None
 
 # =========================
 # RO App client
@@ -251,23 +283,22 @@ class ROAppClient:
 RO = ROAppClient(ROAPP_API_KEY, ROAPP_BASE_URL) if ROAPP_API_KEY else None
 
 # =========================
-# OpenAI (краткий человеческий ответ + анти-DIY в промпте)
+# OpenAI (краткий ответ + анти-DIY + KB-контекст)
 # =========================
 async def ai_reply(user_text: str, history: List[Dict[str, str]]) -> str:
     if not OPENAI_API_KEY:
         return "Расскажите чуть подробнее, что случилось — подскажу и предложу следующий шаг. Если понадобится, оформлю обращение."
 
     system = (
-        "Ты дружелюбный менеджер сервиса {brand}. Говоришь теплом и по делу, 1–3 предложения.\n"
-        "ЖЁСТКИЙ ЗАПРЕТ: не давай инструкции по самостоятельному ремонту, настройке или разборке (никаких шагов, инструментов, схем). "
+        "Ты дружелюбный менеджер сервиса {brand}. Отвечай по-русски, тепло и по делу, 1–3 предложения.\n"
+        "Строгий запрет: не давай инструкций по самостоятельному ремонту/разборке/настройке. "
         "Вместо этого предлагай диагностику/запись/эвакуатор.\n"
-        "Если канал WhatsApp — номер у нас уже есть, проси только имя (один раз и ненавязчиво). "
-        "Используй факты из 'Контекст' при ответе."
+        "Если канал WhatsApp — номер уже известен, проси только имя (один раз). "
+        "Используй факты из блока 'Контекст', если они подходят."
     ).format(brand=COMPANY_NAME)
 
-    # Подмешаем контекст KB top-1 для модели (если найдётся)
     kb_ctx = kb_search(user_text)
-    context_block = f"Контекст: {kb_ctx}" if kb_ctx else "Контекст: (нет явных фактов, отвечай общо)"
+    context_block = f"Контекст: {kb_ctx}" if kb_ctx else "Контекст: (нет явных фактов)"
 
     messages = [{"role": "system", "content": system},
                 {"role": "assistant", "content": context_block}]
@@ -286,8 +317,8 @@ async def ai_reply(user_text: str, history: List[Dict[str, str]]) -> str:
             if r.status_code == 200:
                 data = r.json()
                 text = (data["choices"][0]["message"]["content"] or "").strip()[:1200]
-                # на всякий случай отфильтруем DIY-шаги
-                if is_diy_request(text) or re.search(r"\b(открут|сним|установ|замен|подключ|раскрути|сжатие|компресс)\w*\b", text.lower()):
+                # подстрахуемся от DIY-шагов
+                if is_diy_request(text) or re.search(r"\b(открут|сним|установ|замен|подключ|раскрут|прижми|подтян)\w*\b", text.lower()):
                     return DIY_SAFE_REPLY
                 return text
             if r.status_code in (429, 500, 502, 503, 504):
@@ -295,19 +326,18 @@ async def ai_reply(user_text: str, history: List[Dict[str, str]]) -> str:
             return f"Техническая ошибка AI: HTTP {r.status_code}"
         except Exception:
             await asyncio.sleep(backoff); backoff = min(backoff * 2, 16)
-    return "Сейчас высокая нагрузка. Давайте продолжим чат, параллельно попробую ещё раз."
+    return "Сейчас высокая нагрузка. Давайте продолжим чат, а я попробую ещё раз."
 
 # =========================
-# Telegram handlers
+# Telegram/WhatsApp handlers
 # =========================
 WELCOME_TG = (
-    "Привет! Я менеджер {brand}. Расскажите, что случилось — подскажу. "
+    f"Привет! Я менеджер {COMPANY_NAME}. Расскажите, что случилось — подскажу. "
     "Если готовы сразу оформить, пришлите номер в формате +27XXXXXXXXXX."
-).format(brand=COMPANY_NAME)
-
+)
 WELCOME_WA = (
-    "Привет! Я менеджер {brand}. Расскажите, что случилось — подскажу. "
-    "Кстати, как к вам обращаться?".format(brand=COMPANY_NAME)
+    f"Привет! Я менеджер {COMPANY_NAME}. Расскажите, что случилось — подскажу. "
+    "Кстати, как к вам обращаться?"
 )
 
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -341,7 +371,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (update.message.text or "").strip()
     hist: List[Dict[str, str]] = context.user_data.get("hist") or []
 
-    # если ждём имя (WA)
+    # ждём имя (только для WhatsApp)
     if context.user_data.get("await_name"):
         if looks_like_name(text):
             context.user_data["name"] = text
@@ -354,12 +384,12 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     push_history(hist, "user", text)
     context.user_data["hist"] = hist
 
-    # DIY запрет — перехватываем сразу
+    # 1) DIY — мягкий отказ
     if is_diy_request(text):
         await update.message.reply_text(DIY_SAFE_REPLY)
         return
 
-    # если видим номер (актуально для Telegram) — создаём лид
+    # 2) Телеграм: если встретили номер — создаём лид
     phone = extract_phone(text) if CHANNEL == "telegram" else None
     if phone:
         name = context.user_data.get("name") or tg_display_name(update)
@@ -383,10 +413,10 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 location_id=int(ROAPP_LOCATION_ID) if ROAPP_LOCATION_ID else None,
                 channel=ROAPP_SOURCE,
             )
-            context.user_data["inquiry_id"] = inquiry.get("id")
+            inq_id = inquiry.get("id")
+            context.user_data["inquiry_id"] = inq_id
             await update.message.reply_text(
-                "Готово! ✅ Оформил обращение.\n"
-                f"Номер: <b>{phone}</b>\nИмя: <b>{name}</b>",
+                "Готово! ✅ Заявка создана в CRM (ID: <b>{}</b>).\nНомер: <b>{}</b>\nИмя: <b>{}</b>".format(inq_id, phone, name),
                 parse_mode=ParseMode.HTML,
             )
             return
@@ -400,10 +430,19 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"❌ Техническая ошибка: {e}")
             return
 
-    # БАЗА ЗНАНИЙ → если нашли — отвечаем ею
+    # 2а) Быстрые ответы по намерению (эвакуатор/адрес)
+    qa = quick_intent_answer(text)
+    if qa:
+        if CHANNEL == "whatsapp" and not context.user_data.get("name"):
+            context.user_data["await_name"] = True
+            await update.message.reply_text(f"{qa}\n\nКак к вам обращаться?")
+        else:
+            await update.message.reply_text(qa)
+        return
+
+    # 3) KB → если нашли, ответим
     kb_answer = kb_search(text)
     if kb_answer:
-        # в WA попросим имя один раз
         if CHANNEL == "whatsapp" and not context.user_data.get("name"):
             context.user_data["await_name"] = True
             await update.message.reply_text(f"{kb_answer}\n\nКак к вам обращаться?")
@@ -411,8 +450,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(kb_answer)
         return
 
-    # Иначе — AI
+    # 4) AI
     reply = await ai_reply(text, hist)
+    reply = sanitize_ai_reply(reply, bool(context.user_data.get("inquiry_id")))
     push_history(hist, "assistant", reply)
     hint = maybe_phone_hint(context)
     final = reply if not hint else f"{reply}\n\n{hint}"
