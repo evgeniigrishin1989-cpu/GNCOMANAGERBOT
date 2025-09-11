@@ -1,0 +1,8 @@
+@app.post("/crmhook")
+def crmhook():
+    # validate signature + put to queue (async)
+    return "ok", 200
+
+@app.get("/healthz")
+def healthz():
+    return "ok", 200
