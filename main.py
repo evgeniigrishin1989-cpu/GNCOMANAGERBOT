@@ -21,9 +21,10 @@ from telegram.ext import (
 # -----------------------------
 # ЛОГИ
 # -----------------------------
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+logging.basicConfig(# Спрячем чувствительные лог-записи от httpx и PTB
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("telegram.request").setLevel(logging.WARNING)
+
 )
 log = logging.getLogger("gnco")
 
