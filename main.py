@@ -35,13 +35,12 @@ load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 BOT_SECRET = os.getenv("BOT_SECRET", "gncohook")  # будет частью URL и секретом вебхука
 PUBLIC_BASE_URL = os.getenv("WEBHOOK_URL")         # https://<render>.onrender.com
-
-ROAPP_API_KEY = os.getenv("ROAPP_API_KEY")            # если не задан, просто логируем
-ROAPP_BASE_URL = os.getenv("ROAPP_BASE_URL", "https://api.roapp.io")
-ROAPP_LOCATION_ID = os.getenv("ROAPP_LOCATION_ID")    # optional
-ROAPP_SOURCE = os.getenv("ROAPP_SOURCE", "Telegram")
-
 PORT = int(os.getenv("PORT", "10000"))
+
+ROAPP_API_KEY = os.getenv("ROAPP_API_KEY")
+ROAPP_BASE_URL = os.getenv("ROAPP_BASE_URL", "https://api.roapp.io")
+ROAPP_LOCATION_ID = os.getenv("ROAPP_LOCATION_ID")
+ROAPP_SOURCE = os.getenv("ROAPP_SOURCE", "Telegram")
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is not set")
@@ -134,7 +133,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ждём телефон
     phone = normalize_phone(text)
     if not phone or not PHONE_RE.match(phone):
-        context.user_data["last_msg"] = text  # на всякий
+        context.user_data["last_msg"] = text
         await update.message.reply_text(ASK_PHONE_AGAIN)
         return
 
@@ -171,7 +170,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await update.message.reply_text(f"❌ Ошибка интеграции: {e}")
 
-# любое текстовое сообщение
 async def catch_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message and update.message.text:
         context.user_data["last_msg"] = update.message.text.strip()
@@ -185,7 +183,7 @@ def make_aiohttp_app(ptb_app: Application) -> web.Application:
 
     # 1) Telegram webhook endpoint: /<BOT_SECRET>
     async def telegram_updates(request: web.Request) -> web.Response:
-        # Проверка секрета от Telegram (мы его зададим в set_webhook)
+        # Проверка секрета от Telegram
         secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token")
         if secret != BOT_SECRET:
             return web.Response(status=403, text="forbidden")
@@ -193,7 +191,7 @@ def make_aiohttp_app(ptb_app: Application) -> web.Application:
         await ptb_app.update_queue.put(Update.de_json(data=data, bot=ptb_app.bot))
         return web.Response(text="OK")
 
-    # 2) CRM webhook: /crmhook  (просто лог, можно расширять)
+    # 2) CRM webhook: /crmhook  (пока просто логируем)
     async def crmhook(request: web.Request) -> web.Response:
         try:
             body = await request.read()
@@ -214,7 +212,7 @@ def make_aiohttp_app(ptb_app: Application) -> web.Application:
     return app
 
 # -----------------------------
-# MAIN (кастомный вебхук, без run_webhook)
+# MAIN: свой aiohttp-сервер + ручная регистрация вебхука
 # -----------------------------
 async def main():
     application = Application.builder().token(BOT_TOKEN).updater(None).build()
@@ -224,7 +222,7 @@ async def main():
     application.add_handler(CommandHandler("id", id_cmd))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, catch_all))
 
-    # Готовим aiohttp сервер
+    # aiohttp-сервер
     aio = make_aiohttp_app(application)
     runner = web.AppRunner(aio)
     await runner.setup()
@@ -245,7 +243,6 @@ async def main():
     async with application:
         await application.start()
         try:
-            # просто «спим», пока процесс живёт
             while True:
                 await asyncio.sleep(3600)
         finally:
