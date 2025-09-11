@@ -60,6 +60,7 @@ ROAPP_API_KEY     = os.getenv("ROAPP_API_KEY")
 ROAPP_BASE_URL    = os.getenv("ROAPP_BASE_URL", "https://api.roapp.io")
 ROAPP_LOCATION_ID = os.getenv("ROAPP_LOCATION_ID")
 ROAPP_SOURCE      = os.getenv("ROAPP_SOURCE", "Telegram" if CHANNEL == "telegram" else "WhatsApp")
+ROAPP_VERIFY_SSL  = os.getenv("ROAPP_VERIFY_SSL", "true").lower() not in ("0", "false", "no", "off")
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is not set")
@@ -87,7 +88,6 @@ def extract_phone(text: str) -> Optional[str]:
     return normalize_phone(m.group(0))
 
 def extract_map_link(text: str) -> Optional[str]:
-    """Выцепляем ссылку на карту (google/yandex/waze/osm/2gis/what3words)."""
     if not text:
         return None
     m = URL_RE.search(text)
@@ -99,10 +99,8 @@ def extract_map_link(text: str) -> Optional[str]:
     return None
 
 def friendly_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> str:
-    # сначала берём сохранённое имя
     if context.user_data.get("name"):
         return context.user_data["name"]
-    # затем — из Telegram-профиля (если есть)
     u = update.effective_user
     if not u:
         return ""
@@ -231,7 +229,6 @@ def load_external_kb(path: str = "kb.json") -> List[Dict[str, Any]]:
 KB: List[Dict[str, Any]] = default_kb() + load_external_kb("kb.json")
 
 def kb_search(query: str) -> Optional[str]:
-    """Поиск по KB: канонизируем синонимы, усиливаем эвакуатор/адрес."""
     if not query:
         return None
     q = set(canonical_tokens(query))
@@ -247,7 +244,6 @@ def kb_search(query: str) -> Optional[str]:
         return best_answer
     return best_answer if best_score >= 2 else None
 
-# Быстрые ответы без AI (интенты)
 def quick_intent_answer(text: str) -> Optional[str]:
     q = set(canonical_tokens(text))
     if "эвакуатор" in q:
@@ -268,6 +264,7 @@ class ROAppClient:
             base_url=self.base_url,
             headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
             timeout=30,
+            verify=ROAPP_VERIFY_SSL,  # <-- ключевая настройка SSL
         )
 
     async def close(self):
@@ -417,7 +414,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(DIY_SAFE_REPLY)
         return
 
-    # 1а) если прислали ссылку на карту — принимаем и спрашиваем время
+    # 1а) если прислали ссылку на карту — примем и спросим время
     mlink = extract_map_link(text)
     if mlink:
         context.user_data["pickup_link"] = mlink
@@ -469,7 +466,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # 2а) Быстрые ответы (эвакуатор/адрес)
     qa = quick_intent_answer(text)
     if qa:
-        # в WhatsApp, если имени ещё нет — попросим один раз
         if CHANNEL == "whatsapp" and not context.user_data.get("name"):
             context.user_data["await_name"] = True
             await update.message.reply_text(f"{qa}\n\nКак к вам обращаться?")
@@ -496,7 +492,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(final)
 
 async def catch_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # подстрахуемся: если это текст — в текстовый хэндлер; если локация — в локационный
     if update.message:
         if update.message.location:
             await handle_location(update, context)
@@ -543,7 +538,6 @@ async def main():
 
     application.add_handler(CommandHandler("start", start_cmd))
     application.add_handler(CommandHandler("id", id_cmd))
-    # единый обработчик: и текст, и локации
     application.add_handler(MessageHandler(~filters.COMMAND, catch_all))
 
     aio = make_aiohttp_app(application)
@@ -558,7 +552,7 @@ async def main():
     await application.bot.set_webhook(
         url=telegram_url,
         secret_token=BOT_SECRET,
-        allowed_updates=["message"],  # локации тоже приходят как message
+        allowed_updates=["message"],
     )
 
     async with application:
