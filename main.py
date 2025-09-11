@@ -1,13 +1,17 @@
+# main.py
 import os
 import re
 import json
+import hmac
+import hashlib
 import asyncio
+import logging
 from typing import Optional
 
 import httpx
-from aiohttp import web
 from dotenv import load_dotenv
-from telegram import Update, ReplyKeyboardRemove
+from aiohttp import web
+from telegram import Update
 from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
@@ -18,40 +22,52 @@ from telegram.ext import (
 )
 
 # -----------------------------
-# Env & config
+# Base config & logging
 # -----------------------------
 load_dotenv()
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO"),
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
+log = logging.getLogger("gnco")
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-BOT_SECRET = os.getenv("BOT_SECRET", "gncohook")
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # e.g. https://<your>.onrender.com/gncohook
+BOT_TOKEN = os.getenv("BOT_TOKEN")                         # Telegram bot token
+BOT_SECRET = os.getenv("BOT_SECRET", "gncohook")           # путь и секрет вебхука Telegram
+PUBLIC_BASE_URL = os.getenv("WEBHOOK_URL", "").rstrip("/") # https://gncomanagerbot-1.onrender.com
+PORT = int(os.getenv("PORT", "10000"))
 
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")               # не используем здесь (чтобы не ловить 429)
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
-ROAPP_API_KEY = os.getenv("ROAPP_API_KEY")            # <-- from RO App Settings → API
-ROAPP_BASE_URL = os.getenv("ROAPP_BASE_URL", "https://api.roapp.io")
-ROAPP_LOCATION_ID = os.getenv("ROAPP_LOCATION_ID")    # optional
-ROAPP_SOURCE = os.getenv("ROAPP_SOURCE", "Telegram")  # will be sent into inquiry as channel/source
+# CRM подпись (по желанию, тогда проверяется HMAC)
+CRM_SECRET = os.getenv("CRM_SECRET", "")
 
-PORT = int(os.getenv("PORT", "10000"))
+# RO App (CRM) – для создания лидов по телефону из Telegram
+ROAPP_API_KEY     = os.getenv("ROAPP_API_KEY")
+ROAPP_BASE_URL    = os.getenv("ROAPP_BASE_URL", "https://api.roapp.io")
+ROAPP_LOCATION_ID = os.getenv("ROAPP_LOCATION_ID")         # опционально
+ROAPP_SOURCE      = os.getenv("ROAPP_SOURCE", "Telegram")  # канал/источник
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN not set")
+if not PUBLIC_BASE_URL:
+    raise RuntimeError("WEBHOOK_URL (public base) not set, e.g. https://<app>.onrender.com")
+
+# Полный адрес вебхука Telegram:
+TELEGRAM_WEBHOOK_URL = f"{PUBLIC_BASE_URL}/{BOT_SECRET}"
 
 # -----------------------------
-# Small helpers
+# Helpers
 # -----------------------------
 PHONE_RE = re.compile(r"^\+?\d{7,15}$")
 
 def normalize_phone(raw: str) -> Optional[str]:
-    """Return E.164-like +XXXXXXXXXXXX or None."""
+    """Return +E.164-like or None."""
     if not raw:
         return None
     digits = re.sub(r"\D", "", raw)
     if not digits:
         return None
-    # add + if not present
     return f"+{digits}"
 
 def tg_display_name(update: Update) -> str:
@@ -62,8 +78,33 @@ def tg_display_name(update: Update) -> str:
     name = " ".join(p for p in parts if p).strip()
     return name or (u.username or f"id{u.id}")
 
+def _get_sig_from_headers(headers) -> Optional[str]:
+    """Достаём подпись из разных возможных заголовков."""
+    for key in (
+        "X-Signature-SHA256",
+        "X-Hub-Signature-256",
+        "X-CRM-Signature",
+        "X-Signature",
+        "X-Hub-Signature",
+    ):
+        val = headers.get(key)
+        if val:
+            # может приходить вида "sha256=abcdef..."
+            return val.split("=", 1)[-1].strip()
+    return None
+
+def _check_hmac(raw_body: bytes, headers) -> bool:
+    """Проверяем HMAC-SHA256, если задан CRM_SECRET. Если секрета нет — пропускаем проверку."""
+    if not CRM_SECRET:
+        return True  # проверка отключена
+    their = _get_sig_from_headers(headers)
+    if not their:
+        return False
+    my = hmac.new(CRM_SECRET.encode("utf-8"), raw_body, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(my, their)
+
 # -----------------------------
-# RO App client
+# RO App client (httpx)
 # -----------------------------
 class ROAppClient:
     def __init__(self, api_key: str, base_url: str = "https://api.roapp.io"):
@@ -83,11 +124,6 @@ class ROAppClient:
         location_id: Optional[int] = None,
         channel: Optional[str] = None,
     ) -> dict:
-        """
-        Docs: POST https://api.roapp.io/lead/
-        Required: EITHER client_id OR (contact_phone + contact_name)
-        We'll pass contact_phone + contact_name.
-        """
         payload = {
             "contact_phone": contact_phone,
             "contact_name": contact_name,
@@ -104,51 +140,43 @@ class ROAppClient:
         r.raise_for_status()
         return r.json()
 
-    async def find_people(self, search: str, limit: int = 1) -> dict:
-        """
-        GET https://api.roapp.io/contacts/people?search=...&limit=...
-        Use search to find person by phone/name.
-        """
-        params = {"search": search, "limit": limit}
-        r = await self._client.get("/contacts/people", params=params)
-        r.raise_for_status()
-        return r.json()
-
 RO = ROAppClient(ROAPP_API_KEY, ROAPP_BASE_URL) if ROAPP_API_KEY else None
 
 # -----------------------------
 # Telegram handlers
 # -----------------------------
 WELCOME = (
-    "Ок, начнём. Введите номер телефона в формате +27XXXXXXXXXX "
-    "— и я заведу заявку в CRM."
+    "Ок, начнём. Пришлите номер телефона в формате +27XXXXXXXXXX — "
+    "и я создам заявку в CRM."
 )
-
 ASK_PHONE_AGAIN = "Пожалуйста, пришлите номер телефона в формате +XXXXXXXXXXX."
 
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(WELCOME)
 
 async def id_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(f"Ваш Telegram ID: <code>{update.effective_user.id}</code>", parse_mode=ParseMode.HTML)
+    await update.message.reply_text(
+        f"Ваш Telegram ID: <code>{update.effective_user.id}</code>",
+        parse_mode=ParseMode.HTML,
+    )
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (update.message.text or "").strip()
-
-    # 1) ждём телефон
     phone = normalize_phone(text)
+
     if not phone or not PHONE_RE.match(phone):
+        # запомним фразу для описания лида (если номер пришлют следом)
+        context.user_data["last_msg"] = text
         await update.message.reply_text(ASK_PHONE_AGAIN)
         return
 
-    # 2) нашли/создали лида в RO App
     name = tg_display_name(update)
     last_msg = context.user_data.get("last_msg") or ""
 
     if RO is None:
         await update.message.reply_text(
             "Телефон получил ✅\n"
-            "RO App API ключ не настроен, поэтому создаю заявку только в чате."
+            "Ключ RO App не настроен — создаю заявку только в чате."
         )
         return
 
@@ -161,13 +189,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             location_id=int(ROAPP_LOCATION_ID) if ROAPP_LOCATION_ID else None,
             channel=ROAPP_SOURCE,
         )
-        # запомним минимальную привязку
         context.user_data["phone"] = phone
         context.user_data["inquiry_id"] = inquiry.get("id")
         await update.message.reply_text(
             "Готово! ✅ Заявка создана в CRM.\n"
-            f"Номер: <b>{phone}</b>\n"
-            f"Имя: <b>{name}</b>",
+            f"Номер: <b>{phone}</b>\nИмя: <b>{name}</b>",
             parse_mode=ParseMode.HTML,
         )
     except httpx.HTTPStatusError as e:
@@ -180,31 +206,52 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ Ошибка интеграции: {e}")
 
 async def catch_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # сохраним последний текст на случай, если номер придёт следующим сообщением
+    # сохраняем последний текст — вдруг номер придёт следом
     if update.message and update.message.text:
         context.user_data["last_msg"] = update.message.text.strip()
     await handle_text(update, context)
 
 # -----------------------------
-# AIOHTTP web routes (for RO App webhooks, health, etc.)
+# aiohttp web routes
 # -----------------------------
 async def roapp_webhook(request: web.Request) -> web.Response:
+    # Заглушка под входящие события из RO App (если пригодится)
     try:
         data = await request.json()
     except Exception:
         data = {}
-    # Здесь можно сделать уведомление в чат/лог — по вкусу.
-    # Например, просто отдадим 200 OK:
+    log.info("ROAPP WEBHOOK: %s", json.dumps(data)[:500])
     return web.json_response({"ok": True})
 
-async def health(request: web.Request) -> web.Response:
+async def crm_webhook(request: web.Request) -> web.Response:
+    raw = await request.read()
+    ok = _check_hmac(raw, request.headers)
+    if not ok:
+        log.warning("CRM signature failed")
+        return web.Response(text="unauthorized", status=401)
+
+    # Для отладки просто логируем и отвечаем 200
+    # Здесь позже можно поставить задачу в очередь/обработать событие
+    # и сделать upsert клиента по телефону
+    try:
+        data = json.loads(raw.decode("utf-8") or "{}")
+    except Exception:
+        data = {}
+    log.info("CRM WEBHOOK OK: %s", json.dumps(data)[:800])
+    return web.Response(text="ok")
+
+async def healthz(request: web.Request) -> web.Response:
+    return web.Response(text="ok")
+
+async def root(request: web.Request) -> web.Response:
     return web.Response(text="OK")
 
 def build_web_app() -> web.Application:
     app = web.Application()
-    # Telegram webhook уже занят BOT_SECRET путём; наш — отдельный:
     app.router.add_post("/roapp-webhook", roapp_webhook)
-    app.router.add_get("/", health)
+    app.router.add_post("/crmhook", crm_webhook)
+    app.router.add_get("/healthz", healthz)
+    app.router.add_get("/", root)
     return app
 
 # -----------------------------
@@ -217,29 +264,28 @@ def main() -> None:
     application.add_handler(CommandHandler("start", start_cmd))
     application.add_handler(CommandHandler("id", id_cmd))
 
-    # Ввод телефона и общий текст
+    # Текст/телефон
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, catch_all))
 
-    # AIOHTTP app для доп. маршрутов (RO App вебхук)
+    # AIOHTTP web app с /crmhook и /healthz
     web_app = build_web_app()
 
-    if WEBHOOK_URL:
-        # Telegram webhook mode (Render)
-        application.run_webhook(
-            listen="0.0.0.0",
-            port=PORT,
-            webhook_url=WEBHOOK_URL,
-            secret_token=None,
-            webhook_path=f"/{BOT_SECRET}",
-            web_app=web_app,
-        )
-    else:
-        # Local polling (для отладки)
-        application.run_polling()
+    # Запуск вебхука Telegram
+    application.run_webhook(
+        listen="0.0.0.0",
+        port=PORT,
+        url_path=BOT_SECRET,                   # путь: /<BOT_SECRET>
+        webhook_url=TELEGRAM_WEBHOOK_URL,     # полный публичный URL
+        secret_token=BOT_SECRET,              # Telegram пришлёт его в заголовке
+        web_app=web_app,                      # наш aiohttp-приложение
+    )
 
-    # аккуратно закрываем HTTP клиент RO
+    # Аккуратно закрыть HTTP-клиент RO
     if RO is not None:
-        asyncio.get_event_loop().run_until_complete(RO.close())
+        try:
+            asyncio.get_event_loop().run_until_complete(RO.close())
+        except Exception:
+            pass
 
 if __name__ == "__main__":
     main()
