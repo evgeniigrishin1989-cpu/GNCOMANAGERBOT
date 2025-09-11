@@ -21,11 +21,13 @@ from telegram.ext import (
 # -----------------------------
 # ЛОГИ
 # -----------------------------
-logging.basicConfig(# Спрячем чувствительные лог-записи от httpx и PTB
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+)
+# приглушим болтливые логгеры (чтобы не светить токен в URL)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("telegram.request").setLevel(logging.WARNING)
-
-)
 log = logging.getLogger("gnco")
 
 # -----------------------------
@@ -34,14 +36,14 @@ log = logging.getLogger("gnco")
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-BOT_SECRET = os.getenv("BOT_SECRET", "gncohook")  # будет частью URL и секретом вебхука
-PUBLIC_BASE_URL = os.getenv("WEBHOOK_URL")         # https://<render>.onrender.com
+BOT_SECRET = os.getenv("BOT_SECRET", "gncohook")        # и путь вебхука, и secret_token
+PUBLIC_BASE_URL = os.getenv("WEBHOOK_URL")              # вида https://<render>.onrender.com
 PORT = int(os.getenv("PORT", "10000"))
 
-ROAPP_API_KEY = os.getenv("ROAPP_API_KEY")
-ROAPP_BASE_URL = os.getenv("ROAPP_BASE_URL", "https://api.roapp.io")
+ROAPP_API_KEY     = os.getenv("ROAPP_API_KEY")
+ROAPP_BASE_URL    = os.getenv("ROAPP_BASE_URL", "https://api.roapp.io")
 ROAPP_LOCATION_ID = os.getenv("ROAPP_LOCATION_ID")
-ROAPP_SOURCE = os.getenv("ROAPP_SOURCE", "Telegram")
+ROAPP_SOURCE      = os.getenv("ROAPP_SOURCE", "Telegram")
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is not set")
@@ -184,7 +186,7 @@ def make_aiohttp_app(ptb_app: Application) -> web.Application:
 
     # 1) Telegram webhook endpoint: /<BOT_SECRET>
     async def telegram_updates(request: web.Request) -> web.Response:
-        # Проверка секрета от Telegram
+        # проверка секрета от Telegram
         secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token")
         if secret != BOT_SECRET:
             return web.Response(status=403, text="forbidden")
@@ -196,8 +198,11 @@ def make_aiohttp_app(ptb_app: Application) -> web.Application:
     async def crmhook(request: web.Request) -> web.Response:
         try:
             body = await request.read()
-            log.info("CRM WEBHOOK | headers=%s | body=%s",
-                     dict(request.headers), body.decode("utf-8", errors="ignore"))
+            log.info(
+                "CRM WEBHOOK | headers=%s | body=%s",
+                dict(request.headers),
+                body.decode("utf-8", errors="ignore"),
+            )
         except Exception:
             log.exception("Failed to read CRM webhook")
         return web.Response(text="ok")
@@ -247,14 +252,13 @@ async def main():
             while True:
                 await asyncio.sleep(3600)
         finally:
+            # корректное завершение
             await application.stop()
+            if RO is not None:
+                try:
+                    await RO.close()
+                except Exception:
+                    pass
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    finally:
-        if RO is not None:
-            try:
-                asyncio.run(RO.close())
-            except Exception:
-                pass
+    asyncio.run(main())
